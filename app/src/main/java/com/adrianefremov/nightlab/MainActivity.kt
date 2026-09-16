@@ -633,17 +633,7 @@ class MainActivity : ComponentActivity() {
             }
 
             session.capture(builder.build(), object : CameraCaptureSession.CaptureCallback() {
-                override fun onCaptureCompleted(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    result: TotalCaptureResult
-                ) {
-                    lastCaptureResult = result
-                    runOnUiThread {
-                        statusLabel.text = "SAVED • ISO $selectedIso • ${formatExposure(selectedExposureNs)}"
-                        isCapturing = false
-                    }
-                }
+        
 
               override fun onCaptureFailed(
     session: CameraCaptureSession,
