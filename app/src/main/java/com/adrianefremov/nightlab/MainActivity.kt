@@ -645,7 +645,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-               override fun onCaptureFailed(
+              override fun onCaptureFailed(
     session: CameraCaptureSession,
     request: CaptureRequest,
     failure: CameraCaptureSession.CaptureFailure
@@ -655,15 +655,6 @@ class MainActivity : ComponentActivity() {
         isCapturing = false
     }
 }
-) {
-    ...
-}
-                ) {
-                    runOnUiThread {
-                        statusLabel.text = "CAPTURE FAILED"
-                        isCapturing = false
-                    }
-                }
             }, cameraHandler)
         } catch (e: Exception) {
             isCapturing = false
