@@ -20,13 +20,15 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Gradle
+      - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
 
-      - name: Build Debug APK
+      - name: Build NightLab APK
         run: gradle assembleDebug --stacktrace
 
-      - name: Upload APK
+      - name: Upload NightLab APK
         uses: actions/upload-artifact@v4
         with:
           name: NightLab-debug
