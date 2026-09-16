@@ -1,5 +1,5 @@
 package com.adrianefremov.nightlab
-import android.hardware.camera2.CaptureFailure
+
 import android.Manifest
 import android.content.ContentValues
 import android.content.Context
@@ -9,7 +9,7 @@ import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
-import android.hardware.camera2.CaptureFailure
+
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.DngCreator
@@ -645,10 +645,13 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                override fun onCaptureFailed(
-                    session: CameraCaptureSession,
-                    request: CaptureRequest,
-                    failure: CameraCaptureSession.CaptureFailure
+               override fun onCaptureFailed(
+    session: CameraCaptureSession,
+    request: CaptureRequest,
+    failure: CaptureFailure
+) {
+    ...
+}
                 ) {
                     runOnUiThread {
                         statusLabel.text = "CAPTURE FAILED"
