@@ -16,7 +16,7 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
 import android.media.Image
-import android.media.ImageFormat
+import android.graphics.ImageFormat
 import android.media.ImageReader
 import android.net.Uri
 import android.os.Bundle
@@ -28,6 +28,7 @@ import android.view.Surface
 import android.view.TextureView
 import android.view.ViewGroup
 import android.widget.ArrayAdapter
+import android.widget.AdapterView
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.LinearLayout
@@ -239,28 +240,44 @@ class MainActivity : ComponentActivity() {
 
         root.addView(title, -1, -2)
         root.addView(mode, -1, -2)
-        root.addView(preview, -1, 0, 1f)
+        root.addView(preview, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         root.addView(status, -1, -2)
         root.addView(controls, -1, -2)
 
         setContentView(root)
 
-        isoSpinner.onItemSelectedListener =
-            SimpleItemSelectedListener { position ->
+        isoSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(
+                parent: AdapterView<*>?,
+                view: android.view.View?,
+                position: Int,
+                id: Long
+            ) {
                 if (isoValues.isNotEmpty()) {
                     selectedIso = isoValues[position.coerceIn(0, isoValues.lastIndex)]
                     updatePreview()
                 }
             }
 
-        shutterSpinner.onItemSelectedListener =
-            SimpleItemSelectedListener { position ->
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
+
+        shutterSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(
+                parent: AdapterView<*>?,
+                view: android.view.View?,
+                position: Int,
+                id: Long
+            ) {
                 if (shutterValuesNs.isNotEmpty()) {
                     selectedExposureNs =
                         shutterValuesNs[position.coerceIn(0, shutterValuesNs.lastIndex)]
                     updatePreview()
                 }
             }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+        }
 
         focusBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(
@@ -423,12 +440,12 @@ class MainActivity : ComponentActivity() {
             c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
 
         val capabilities =
-            c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES).orEmpty()
+            c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES) ?: intArrayOf()
 
         val map =
             c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
 
-        val rawSizes = map?.getOutputSizes(ImageFormat.RAW_SENSOR).orEmpty()
+        val rawSizes = map?.getOutputSizes(ImageFormat.RAW_SENSOR) ?: emptyArray()
 
         rawSupported =
             capabilities.contains(
