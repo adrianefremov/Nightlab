@@ -14,7 +14,7 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.DngCreator
 import android.media.Image
-import android.media.ImageFormat
+import android.graphics.ImageFormat
 import android.media.ImageReader
 import android.net.Uri
 import android.os.Build
