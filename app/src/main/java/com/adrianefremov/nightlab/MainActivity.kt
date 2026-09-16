@@ -9,6 +9,7 @@ import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.DngCreator
@@ -250,9 +251,7 @@ class MainActivity : ComponentActivity() {
         }
         controls.addView(statusLabel, lpWrap())
 
-        val shutterArea = FrameLayout(this).apply {
-            gravity = Gravity.CENTER
-        }
+        val shutterArea = FrameLayout(this)
 
         val captureButton = TextView(this).apply {
             text = "●"
