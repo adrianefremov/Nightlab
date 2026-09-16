@@ -4,16 +4,18 @@ import android.Manifest
 import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
-
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
-import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.DngCreator
+import android.media.Image
+import android.media.ImageFormat
+import android.media.ImageReader
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -21,16 +23,13 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.provider.MediaStore
 import android.view.Gravity
-import android.view.MotionEvent
 import android.view.Surface
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
-import android.widget.AdapterView
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.CheckBox
-import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.Spinner
@@ -39,75 +38,99 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
-import android.media.Image
-import android.media.ImageReader
+import java.io.File
 import java.io.FileOutputStream
+import java.io.OutputStream
 import java.util.Locale
-import kotlin.math.abs
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var textureView: TextureView
+    private lateinit var statusText: TextView
     private lateinit var isoSpinner: Spinner
     private lateinit var shutterSpinner: Spinner
-    private lateinit var focusSeekBar: SeekBar
-    private lateinit var focusLabel: TextView
-    private lateinit var rawCheckBox: CheckBox
-    private lateinit var infoLabel: TextView
-    private lateinit var statusLabel: TextView
-    val shutterArea = FrameLayout(this)
+    private lateinit var focusBar: SeekBar
+    private lateinit var focusText: TextView
+    private lateinit var rawCheck: CheckBox
+    private lateinit var captureButton: Button
+
     private lateinit var cameraManager: CameraManager
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
-    private var previewBuilder: CaptureRequest.Builder? = null
+    private var characteristics: CameraCharacteristics? = null
+    private var cameraId: String? = null
 
+    private var previewReader: ImageReader? = null
     private var jpegReader: ImageReader? = null
     private var rawReader: ImageReader? = null
-    private var cameraId: String? = null
-    private var characteristics: CameraCharacteristics? = null
 
-    private var exposureMin = 1_000_000L
-    private var exposureMax = 30_000_000_000L
-    private var isoMin = 100
-    private var isoMax = 6400
-    private var minFocusDistance = 0f
-    private var rawSupported = false
+    private var cameraThread: HandlerThread? = null
+    private var cameraHandler: Handler? = null
+
+    private var sensorWidth = 1920
+    private var sensorHeight = 1080
+    private var previewWidth = 1920
+    private var previewHeight = 1080
+
+    private var isoValues = listOf(100)
+    private var shutterValuesNs = listOf(1_000_000_000L)
 
     private var selectedIso = 100
     private var selectedExposureNs = 1_000_000_000L
-    private var lastCaptureResult: TotalCaptureResult? = null
+    private var focusDistance = 0f
 
-    private lateinit var cameraThread: HandlerThread
-    private lateinit var cameraHandler: Handler
+    private var minimumFocusDistance = 0f
+    private var rawSupported = false
+
+    private var pendingJpegUri: Uri? = null
+    private var pendingDngUri: Uri? = null
+    private var pendingCaptureResult: TotalCaptureResult? = null
+    private var pendingRawImage: Image? = null
 
     private var isCapturing = false
+    private var cameraOpening = false
 
-    private val permissionLauncher =
+    private val cameraPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            if (granted) openCameraWhenReady()
-            else toast("NightLab behöver kamerabehörighet.")
+            if (granted) {
+                startCameraThread()
+                openCameraWhenReady()
+            } else {
+                statusText.text = "KAMERABEHEHÖRIGHET KRÄVS"
+                Toast.makeText(
+                    this,
+                    "NightLab behöver kamerabehörighet.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
         }
-
-    private val textureListener = object : TextureView.SurfaceTextureListener {
-        override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
-            openCameraWhenReady()
-        }
-        override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
-        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
-        override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
-    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        startCameraThread()
+
         createInterface()
 
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            == PackageManager.PERMISSION_GRANTED) {
-            openCameraWhenReady()
+        cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            startCameraThread()
         } else {
-            permissionLauncher.launch(Manifest.permission.CAMERA)
+            cameraPermission.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+
+        if (::textureView.isInitialized && textureView.isAvailable &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            startCameraThread()
+            openCameraWhenReady()
         }
     }
 
@@ -118,14 +141,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         closeCamera()
-        cameraThread.quitSafely()
+        stopCameraThread()
         super.onDestroy()
-    }
-
-    private fun startCameraThread() {
-        cameraThread = HandlerThread("NightLabCamera")
-        cameraThread.start()
-        cameraHandler = Handler(cameraThread.looper)
     }
 
     private fun createInterface() {
@@ -136,7 +153,7 @@ class MainActivity : ComponentActivity() {
 
         val title = TextView(this).apply {
             text = "NIGHTLAB"
-            textSize = 24f
+            textSize = 27f
             setTextColor(0xFFFFFFFF.toInt())
             gravity = Gravity.CENTER
             setPadding(0, 18, 0, 2)
@@ -144,601 +161,843 @@ class MainActivity : ComponentActivity() {
 
         val mode = TextView(this).apply {
             text = "PRO  •  NIGHT  •  CAMERA2"
-            textSize = 13f
-            setTextColor(0xFFCCCCCC.toInt())
+            textSize = 15f
+            setTextColor(0xFFD0D0D0.toInt())
             gravity = Gravity.CENTER
-            setPadding(0, 0, 0, 8)
+            setPadding(0, 0, 0, 12)
         }
 
         textureView = TextureView(this).apply {
-            surfaceTextureListener = textureListener
-            setOnTouchListener { _, event ->
-                if (event.action == MotionEvent.ACTION_UP) {
-                    focusAtTouch(event.x, event.y)
-                }
-                true
-            }
+            surfaceTextureListener = surfaceListener
+            keepScreenOn = true
         }
 
-        root.addView(title, lpWrap())
-        root.addView(mode, lpWrap())
-        root.addView(textureView, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f
-        ))
+        statusText = TextView(this).apply {
+            text = "STARTAR KAMERA…"
+            textSize = 13f
+            setTextColor(0xFFBDBDBD.toInt())
+            gravity = Gravity.CENTER
+            setPadding(0, 8, 0, 4)
+        }
 
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(12, 6, 12, 4)
+            setPadding(18, 4, 18, 8)
         }
 
-        val exposureRow = LinearLayout(this).apply {
+        val row1 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
         }
 
-        val isoTitle = label("ISO")
         isoSpinner = Spinner(this)
-        val shutterTitle = label("SHUTTER")
         shutterSpinner = Spinner(this)
 
-        exposureRow.addView(isoTitle, lpWrap())
-        exposureRow.addView(isoSpinner, LinearLayout.LayoutParams(120, 48))
-        exposureRow.addView(shutterTitle, lpWrap())
-        exposureRow.addView(shutterSpinner, LinearLayout.LayoutParams(150, 48))
-        controls.addView(exposureRow)
+        row1.addView(
+            labeledControl("ISO", isoSpinner),
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
 
-        focusLabel = label("FOCUS: AUTO").apply {
+        row1.addView(
+            labeledControl("SHUTTER", shutterSpinner),
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+
+        controls.addView(row1)
+
+        focusText = TextView(this).apply {
+            text = "FOCUS: AUTO"
+            textSize = 15f
+            setTextColor(0xFFFFFFFF.toInt())
             gravity = Gravity.CENTER
-            setPadding(0, 4, 0, 0)
+            setPadding(0, 8, 0, 2)
         }
-        controls.addView(focusLabel, lpWrap())
 
-        focusSeekBar = SeekBar(this).apply {
-            max = 1000
+        focusBar = SeekBar(this).apply {
+            max = 100
             progress = 0
         }
-        controls.addView(focusSeekBar, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 38
-        ))
 
-        val quickRow = LinearLayout(this).apply {
+        controls.addView(focusText)
+        controls.addView(focusBar)
+
+        val row2 = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
+            gravity = Gravity.CENTER_VERTICAL
         }
 
-        val infinity = Button(this).apply {
-            text = "∞"
-            setOnClickListener { setInfinityFocus() }
-        }
-        val autoFocus = Button(this).apply {
-            text = "AF"
-            setOnClickListener { setAutoFocus() }
-        }
-        val night30 = Button(this).apply {
-            text = "30s"
-            setOnClickListener { selectShutter(30_000_000_000L) }
-        }
-        val iso800 = Button(this).apply {
-            text = "ISO 800"
-            setOnClickListener { selectIso(800) }
-        }
-
-        quickRow.addView(infinity, LinearLayout.LayoutParams(0, 44, 1f))
-        quickRow.addView(autoFocus, LinearLayout.LayoutParams(0, 44, 1f))
-        quickRow.addView(night30, LinearLayout.LayoutParams(0, 44, 1f))
-        quickRow.addView(iso800, LinearLayout.LayoutParams(0, 44, 1f))
-        controls.addView(quickRow)
-
-        rawCheckBox = CheckBox(this).apply {
+        rawCheck = CheckBox(this).apply {
             text = "RAW / DNG"
-            textSize = 14f
+            textSize = 15f
             setTextColor(0xFFFFFFFF.toInt())
-            isEnabled = false
+            isChecked = false
         }
-        controls.addView(rawCheckBox, lpWrap())
 
-        infoLabel = label("Analyserar kameran...").apply {
-            textSize = 12f
-            setTextColor(0xFFAAAAAA.toInt())
-            gravity = Gravity.CENTER
+        val galleryButton = Button(this).apply {
+            text = "SENASTE BILDER"
+            setOnClickListener { openPicturesFolder() }
         }
-        controls.addView(infoLabel, lpWrap())
 
-        statusLabel = label("READY").apply {
-            textSize = 12f
-            setTextColor(0xFFBBBBBB.toInt())
-            gravity = Gravity.CENTER
-        }
-        controls.addView(statusLabel, lpWrap())
+        row2.addView(
+            rawCheck,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+        row2.addView(galleryButton)
 
-        val shutterArea = FrameLayout(this)
+        controls.addView(row2)
 
-        val captureButton = TextView(this).apply {
-            text = "●"
-            textSize = 38f
-            setTextColor(0xFF000000.toInt())
-            gravity = Gravity.CENTER
-            background = android.graphics.drawable.GradientDrawable().apply {
-                shape = android.graphics.drawable.GradientDrawable.OVAL
-                setColor(0xFFFFFFFF.toInt())
-                setStroke(7, 0xFFAAAAAA.toInt())
-            }
-            isClickable = true
+        captureButton = Button(this).apply {
+            text = "  ●  TA BILD  "
+            textSize = 21f
+            setAllCaps(false)
             setOnClickListener { capturePhoto() }
-            setOnTouchListener { view, event ->
-                when (event.action) {
-                    MotionEvent.ACTION_DOWN -> {
-                        view.scaleX = 0.90f
-                        view.scaleY = 0.90f
-                    }
-                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                        view.scaleX = 1f
-                        view.scaleY = 1f
-                    }
-                }
-                false
-            }
         }
 
-        shutterArea.addView(captureButton, FrameLayout.LayoutParams(82, 82).apply {
-            gravity = Gravity.CENTER
-        })
+        controls.addView(
+            captureButton,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
 
-        controls.addView(shutterArea, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 90
-        ))
-
-        val captureText = TextView(this).apply {
-            text = "CAPTURE"
-            textSize = 12f
-            setTextColor(0xFFFFFFFF.toInt())
-            gravity = Gravity.CENTER
-        }
-        controls.addView(captureText, lpWrap())
-
-        root.addView(controls, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        ))
+        root.addView(
+            title,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
+        root.addView(
+            mode,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
+        root.addView(
+            textureView,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                0,
+                1f
+            )
+        )
+        root.addView(
+            statusText,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
+        root.addView(
+            controls,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
 
         setContentView(root)
 
-        focusSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(bar: SeekBar?, progress: Int, fromUser: Boolean) {
-                if (minFocusDistance > 0f && fromUser) {
-                    val focus = minFocusDistance * progress / 1000f
-                    focusLabel.text = String.format(Locale.US, "FOCUS: %.2f", focus)
-                    updatePreview()
+        isoSpinner.onItemSelectedListener = SimpleItemSelectedListener {
+            if (isoValues.isNotEmpty()) {
+                selectedIso = isoValues[it.coerceIn(0, isoValues.lastIndex)]
+                updatePreview()
+            }
+        }
+
+        shutterSpinner.onItemSelectedListener = SimpleItemSelectedListener {
+            if (shutterValuesNs.isNotEmpty()) {
+                selectedExposureNs =
+                    shutterValuesNs[it.coerceIn(0, shutterValuesNs.lastIndex)]
+                updatePreview()
+            }
+        }
+
+        focusBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(
+                seekBar: SeekBar,
+                progress: Int,
+                fromUser: Boolean
+            ) {
+                if (minimumFocusDistance > 0f) {
+                    focusDistance =
+                        minimumFocusDistance * (progress / 100f)
+
+                    focusText.text =
+                        String.format(Locale.US, "FOCUS: %.2f", focusDistance)
+
+                    if (fromUser) updatePreview()
+                } else {
+                    focusText.text = "FOCUS: AUTO"
                 }
             }
-            override fun onStartTrackingTouch(bar: SeekBar?) {}
-            override fun onStopTrackingTouch(bar: SeekBar?) {}
+
+            override fun onStartTrackingTouch(seekBar: SeekBar) = Unit
+            override fun onStopTrackingTouch(seekBar: SeekBar) = Unit
         })
     }
 
-    private fun label(textValue: String) = TextView(this).apply {
-        text = textValue
-        textSize = 14f
-        setTextColor(0xFFFFFFFF.toInt())
-        gravity = Gravity.CENTER_VERTICAL
-        setPadding(6, 0, 6, 0)
+    private fun labeledControl(label: String, spinner: Spinner): LinearLayout {
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+        }
+
+        val title = TextView(this).apply {
+            text = label
+            textSize = 11f
+            setTextColor(0xFFAAAAAA.toInt())
+            gravity = Gravity.CENTER
+        }
+
+        box.addView(title)
+        box.addView(
+            spinner,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        )
+
+        return box
     }
 
-    private fun lpWrap() = LinearLayout.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT,
-        ViewGroup.LayoutParams.WRAP_CONTENT
-    )
+    private val surfaceListener = object : TextureView.SurfaceTextureListener {
+        override fun onSurfaceTextureAvailable(
+            surface: SurfaceTexture,
+            width: Int,
+            height: Int
+        ) {
+            openCameraWhenReady()
+        }
+
+        override fun onSurfaceTextureSizeChanged(
+            surface: SurfaceTexture,
+            width: Int,
+            height: Int
+        ) = Unit
+
+        override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+            closeCamera()
+            return true
+        }
+
+        override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+    }
+
+    private fun startCameraThread() {
+        if (cameraThread != null) return
+
+        cameraThread = HandlerThread("NightLabCamera").also { it.start() }
+        cameraHandler = Handler(cameraThread!!.looper)
+    }
+
+    private fun stopCameraThread() {
+        cameraThread?.quitSafely()
+        try {
+            cameraThread?.join()
+        } catch (_: InterruptedException) {
+        }
+        cameraThread = null
+        cameraHandler = null
+    }
 
     private fun openCameraWhenReady() {
-        if (!textureView.isAvailable || cameraDevice != null) return
+        if (!::textureView.isInitialized ||
+            !textureView.isAvailable ||
+            cameraDevice != null ||
+            cameraOpening ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+
+        if (cameraHandler == null) startCameraThread()
 
         try {
-            findBackCamera()
-            val id = cameraId ?: return
+            val id = findBackCamera()
+            cameraId = id
 
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-                != PackageManager.PERMISSION_GRANTED) return
-
-            cameraManager.openCamera(id, object : CameraDevice.StateCallback() {
-                override fun onOpened(camera: CameraDevice) {
-                    cameraDevice = camera
-                    createCameraSession()
-                }
-                override fun onDisconnected(camera: CameraDevice) {
-                    camera.close()
-                    cameraDevice = null
-                }
-                override fun onError(camera: CameraDevice, error: Int) {
-                    camera.close()
-                    cameraDevice = null
-                    toast("Kamerafel: $error")
-                }
-            }, cameraHandler)
-        } catch (e: Exception) {
-            toast("Kunde inte öppna kameran: ${e.message}")
-        }
-    }
-
-    private fun findBackCamera() {
-        for (id in cameraManager.cameraIdList) {
-            val c = cameraManager.getCameraCharacteristics(id)
-            if (c.get(CameraCharacteristics.LENS_FACING)
-                == CameraCharacteristics.LENS_FACING_BACK) {
-
-                cameraId = id
-                characteristics = c
-
-                c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let {
-                    exposureMin = it.lower
-                    exposureMax = minOf(it.upper, 120_000_000_000L)
-                }
-
-                c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let {
-                    isoMin = it.lower
-                    isoMax = minOf(it.upper, 6400)
-                }
-
-                minFocusDistance =
-                    c.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
-
-                rawSupported = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
-                    ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
-
-                runOnUiThread { setupControls() }
+            if (id == null) {
+                statusText.text = "INGEN BAKKAMERA HITTADES"
                 return
             }
+
+            val chars = cameraManager.getCameraCharacteristics(id)
+            characteristics = chars
+
+            configureCapabilities(chars)
+
+            cameraOpening = true
+            cameraManager.openCamera(id, cameraStateCallback, cameraHandler)
+        } catch (e: Exception) {
+            cameraOpening = false
+            statusText.text = "KAMERAÖPPNING MISSLYCKADES"
+            toast("Kunde inte öppna kameran: ${e.message ?: "okänt fel"}")
         }
     }
 
-    private fun setupControls() {
-        val isoValues = listOf(50, 100, 200, 400, 800, 1600, 3200, 6400)
-            .filter { it in isoMin..isoMax }
-            .ifEmpty { listOf(isoMin) }
-
-        isoSpinner.adapter = ArrayAdapter(
-            this, android.R.layout.simple_spinner_dropdown_item,
-            isoValues.map { "ISO $it" }
-        )
-
-        selectedIso = isoValues.firstOrNull { it >= 100 } ?: isoValues.first()
-        isoSpinner.setSelection(isoValues.indexOf(selectedIso).coerceAtLeast(0))
-        isoSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
-                selectedIso = isoValues[pos]
-                updatePreview()
+    private fun findBackCamera(): String? {
+        for (id in cameraManager.cameraIdList) {
+            val chars = cameraManager.getCameraCharacteristics(id)
+            val facing = chars.get(CameraCharacteristics.LENS_FACING)
+            if (facing == CameraCharacteristics.LENS_FACING_BACK) {
+                return id
             }
-            override fun onNothingSelected(p: AdapterView<*>?) {}
         }
-
-        val shutterValues = listOf(
-            125_000_000L to "1/8s",
-            250_000_000L to "1/4s",
-            500_000_000L to "1/2s",
-            1_000_000_000L to "1s",
-            2_000_000_000L to "2s",
-            4_000_000_000L to "4s",
-            8_000_000_000L to "8s",
-            15_000_000_000L to "15s",
-            30_000_000_000L to "30s",
-            60_000_000_000L to "60s",
-            120_000_000_000L to "120s"
-        ).filter { it.first in exposureMin..exposureMax }
-            .ifEmpty { listOf(exposureMin to formatExposure(exposureMin)) }
-
-        shutterSpinner.adapter = ArrayAdapter(
-            this, android.R.layout.simple_spinner_dropdown_item,
-            shutterValues.map { it.second }
-        )
-
-        selectedExposureNs = shutterValues.firstOrNull { it.first == 1_000_000_000L }?.first
-            ?: shutterValues.first().first
-
-        shutterSpinner.setSelection(
-            shutterValues.indexOfFirst { it.first == selectedExposureNs }.coerceAtLeast(0)
-        )
-        shutterSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
-                selectedExposureNs = shutterValues[pos].first
-                updatePreview()
-            }
-            override fun onNothingSelected(p: AdapterView<*>?) {}
-        }
-
-        focusSeekBar.isEnabled = minFocusDistance > 0f
-        rawCheckBox.isEnabled = rawSupported
-        rawCheckBox.isChecked = rawSupported
-
-        infoLabel.text = "ISO $isoMin–$isoMax  •  ${formatExposure(exposureMin)}–${formatExposure(exposureMax)}" +
-            if (rawSupported) "  •  RAW OK" else "  •  JPEG"
+        return null
     }
 
-    private fun createCameraSession() {
-        val camera = cameraDevice ?: return
-        val chars = characteristics ?: return
-        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return
+    private fun configureCapabilities(chars: CameraCharacteristics) {
+        val isoRange =
+            chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
 
-        try {
-            val jpegSizes = map.getOutputSizes(ImageFormat.JPEG)
-            val jpegSize = jpegSizes
-                ?.minByOrNull { abs((it.width * it.height) - 12_000_000) }
-                ?: android.util.Size(1920, 1080)
+        val minIso = isoRange?.lower ?: 100
+        val maxIso = minOf(isoRange?.upper ?: 6400, 6400)
 
-            val previewSize = map.getOutputSizes(SurfaceTexture::class.java)
-                ?.minByOrNull { abs((it.width * it.height) - 2_000_000) }
-                ?: android.util.Size(1920, 1080)
+        isoValues = listOf(50, 100, 200, 400, 800, 1600, 3200, 6400)
+            .filter { it in minIso..maxIso }
+            .ifEmpty { listOf(minIso) }
 
-            textureView.surfaceTexture?.setDefaultBufferSize(
-                previewSize.width, previewSize.height
+        selectedIso = isoValues.firstOrNull { it == 100 } ?: isoValues.first()
+
+        val exposureRange =
+            chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+
+        val minExposure =
+            exposureRange?.lower ?: 1_000_000L
+
+        val maxExposure =
+            minOf(
+                exposureRange?.upper ?: 30_000_000_000L,
+                120_000_000_000L
             )
 
-            val previewSurface = Surface(textureView.surfaceTexture)
+        val requested = listOf(
+            125_000_000L,
+            250_000_000L,
+            500_000_000L,
+            1_000_000_000L,
+            2_000_000_000L,
+            4_000_000_000L,
+            8_000_000_000L,
+            15_000_000_000L,
+            30_000_000_000L,
+            60_000_000_000L,
+            120_000_000_000L
+        )
 
-            jpegReader = ImageReader.newInstance(
-                jpegSize.width, jpegSize.height, ImageFormat.JPEG, 2
-            ).also { reader ->
-                reader.setOnImageAvailableListener({ r ->
-                    r.acquireLatestImage()?.let { saveJpeg(it) }
+        shutterValuesNs = requested
+            .filter { it in minExposure..maxExposure }
+            .ifEmpty { listOf(maxExposure.coerceAtLeast(minExposure)) }
+
+        selectedExposureNs =
+            shutterValuesNs.firstOrNull { it == 1_000_000_000L }
+                ?: shutterValuesNs.first()
+
+        minimumFocusDistance =
+            chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+
+        rawSupported =
+            chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
+
+        runOnUiThread {
+            configureSpinner(
+                isoSpinner,
+                isoValues.map { "ISO $it" },
+                isoValues.indexOf(selectedIso).coerceAtLeast(0)
+            )
+
+            configureSpinner(
+                shutterSpinner,
+                shutterValuesNs.map { formatExposure(it) },
+                shutterValuesNs.indexOf(selectedExposureNs).coerceAtLeast(0)
+            )
+
+            rawCheck.isEnabled = rawSupported
+            if (!rawSupported) rawCheck.isChecked = false
+
+            focusBar.isEnabled = minimumFocusDistance > 0f
+            focusText.text =
+                if (minimumFocusDistance > 0f) "FOCUS: 0.00" else "FOCUS: AUTO"
+
+            statusText.text =
+                "ISO ${isoValues.first()}–${isoValues.last()} • " +
+                    "${formatExposure(shutterValuesNs.first())}–${formatExposure(shutterValuesNs.last())}" +
+                    if (rawSupported) " • RAW OK" else " • RAW EJ TILLGÄNGLIG"
+        }
+    }
+
+    private fun configureSpinner(
+        spinner: Spinner,
+        values: List<String>,
+        selected: Int
+    ) {
+        val adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_item,
+            values
+        )
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        spinner.adapter = adapter
+        spinner.setSelection(selected, false)
+    }
+
+    private val cameraStateCallback = object : CameraDevice.StateCallback() {
+        override fun onOpened(camera: CameraDevice) {
+            cameraOpening = false
+            cameraDevice = camera
+            createReaders()
+            createCaptureSession()
+        }
+
+        override fun onDisconnected(camera: CameraDevice) {
+            cameraOpening = false
+            camera.close()
+            cameraDevice = null
+            statusText.text = "KAMERA FRÅNKOPPLAD"
+        }
+
+        override fun onError(camera: CameraDevice, error: Int) {
+            cameraOpening = false
+            camera.close()
+            cameraDevice = null
+            statusText.text = "KAMERAFEL: $error"
+        }
+    }
+
+    private fun createReaders() {
+        jpegReader?.close()
+        rawReader?.close()
+
+        val size = chooseOutputSize(
+            characteristics?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                ?.getOutputSizes(ImageFormat.JPEG)
+        )
+
+        sensorWidth = size.first
+        sensorHeight = size.second
+
+        jpegReader = ImageReader.newInstance(
+            size.first,
+            size.second,
+            ImageFormat.JPEG,
+            2
+        )
+
+        jpegReader?.setOnImageAvailableListener({ reader ->
+            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+            try {
+                saveJpeg(image)
+            } finally {
+                image.close()
+            }
+        }, cameraHandler)
+
+        if (rawSupported) {
+            val rawSize = chooseOutputSize(
+                characteristics?.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                    ?.getOutputSizes(ImageFormat.RAW_SENSOR)
+            )
+
+            if (rawSize.first > 0 && rawSize.second > 0) {
+                rawReader = ImageReader.newInstance(
+                    rawSize.first,
+                    rawSize.second,
+                    ImageFormat.RAW_SENSOR,
+                    2
+                )
+
+                rawReader?.setOnImageAvailableListener({ reader ->
+                    val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+
+                    if (!rawCheck.isChecked || pendingCaptureResult == null) {
+                        image.close()
+                        return@setOnImageAvailableListener
+                    }
+
+                    pendingRawImage?.close()
+                    pendingRawImage = image
+
+                    savePendingDngIfReady()
                 }, cameraHandler)
             }
+        }
+    }
 
-            val surfaces = mutableListOf(previewSurface, jpegReader!!.surface)
+    private fun chooseOutputSize(sizes: Array<android.util.Size>?): Pair<Int, Int> {
+        if (sizes.isNullOrEmpty()) return Pair(1920, 1080)
 
-            if (rawSupported) {
-                map.getOutputSizes(ImageFormat.RAW_SENSOR)
-                    ?.maxByOrNull { it.width * it.height }
-                    ?.let { rawSize ->
-                        rawReader = ImageReader.newInstance(
-                            rawSize.width, rawSize.height, ImageFormat.RAW_SENSOR, 2
-                        ).also { reader ->
-                            reader.setOnImageAvailableListener({ r ->
-                                r.acquireLatestImage()?.let { saveDng(it) }
-                            }, cameraHandler)
-                        }
-                        surfaces.add(rawReader!!.surface)
-                    }
-            }
+        val largest = sizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
+            ?: return Pair(1920, 1080)
 
-            camera.createCaptureSession(
+        return Pair(largest.width, largest.height)
+    }
+
+    private fun createCaptureSession() {
+        val device = cameraDevice ?: return
+        val texture = textureView.surfaceTexture ?: return
+        val jpegSurface = jpegReader?.surface ?: return
+
+        previewWidth = textureView.width.coerceAtLeast(1280)
+        previewHeight = textureView.height.coerceAtLeast(720)
+
+        texture.setDefaultBufferSize(previewWidth, previewHeight)
+
+        val previewSurface = Surface(texture)
+
+        val surfaces = mutableListOf<Surface>()
+        surfaces.add(previewSurface)
+        surfaces.add(jpegSurface)
+
+        rawReader?.surface?.let { surfaces.add(it) }
+
+        try {
+            device.createCaptureSession(
                 surfaces,
                 object : CameraCaptureSession.StateCallback() {
                     override fun onConfigured(session: CameraCaptureSession) {
                         captureSession = session
-                        previewBuilder = camera.createCaptureRequest(
-                            CameraDevice.TEMPLATE_PREVIEW
-                        ).apply {
-                            addTarget(previewSurface)
-                        }
-                        setAutoFocus()
+                        startPreview()
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
-                        toast("Kunde inte konfigurera kameran.")
+                        statusText.text = "KAMERASESSION MISSLYCKADES"
                     }
                 },
                 cameraHandler
             )
         } catch (e: Exception) {
-            toast("Kamerakonfiguration misslyckades: ${e.message}")
+            statusText.text = "SESSIONFEL"
+        }
+    }
+
+    private fun startPreview() {
+        val device = cameraDevice ?: return
+        val session = captureSession ?: return
+        val texture = textureView.surfaceTexture ?: return
+
+        texture.setDefaultBufferSize(previewWidth, previewHeight)
+        val surface = Surface(texture)
+
+        try {
+            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            builder.addTarget(surface)
+
+            builder.set(
+                CaptureRequest.CONTROL_MODE,
+                CameraMetadataCompat.CONTROL_MODE_AUTO
+            )
+
+            builder.set(
+                CaptureRequest.CONTROL_AF_MODE,
+                if (minimumFocusDistance > 0f)
+                    CaptureRequest.CONTROL_AF_MODE_OFF
+                else
+                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+            )
+
+            if (minimumFocusDistance > 0f) {
+                builder.set(
+                    CaptureRequest.LENS_FOCUS_DISTANCE,
+                    focusDistance
+                )
+            }
+
+            session.setRepeatingRequest(
+                builder.build(),
+                null,
+                cameraHandler
+            )
+
+            statusText.text =
+                "READY • ISO $selectedIso • ${formatExposure(selectedExposureNs)}"
+        } catch (e: Exception) {
+            statusText.text = "PREVIEWFEL"
         }
     }
 
     private fun updatePreview() {
-        val session = captureSession ?: return
-        val builder = previewBuilder ?: return
-
-        try {
-            builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-            builder.set(
-                CaptureRequest.CONTROL_AF_MODE,
-                if (focusSeekBar.progress == 0)
-                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-                else CaptureRequest.CONTROL_AF_MODE_OFF
-            )
-
-            if (minFocusDistance > 0f && focusSeekBar.progress > 0) {
-                builder.set(
-                    CaptureRequest.LENS_FOCUS_DISTANCE,
-                    minFocusDistance * focusSeekBar.progress / 1000f
-                )
-            }
-
-            session.setRepeatingRequest(builder.build(), null, cameraHandler)
-        } catch (_: Exception) {}
-    }
-
-    private fun focusAtTouch(x: Float, y: Float) {
-        if (minFocusDistance <= 0f) return
-
-        // Manual focus is represented by the seekbar; touching the preview
-        // switches to a useful near/mid focus point instead of leaving AUTO.
-        val progress = ((y / textureView.height.coerceAtLeast(1)) * 1000f)
-            .toInt().coerceIn(1, 1000)
-
-        focusSeekBar.progress = progress
-        focusLabel.text = "FOCUS: MANUAL"
-        updatePreview()
-    }
-
-    private fun setInfinityFocus() {
-        if (minFocusDistance <= 0f) return
-        focusSeekBar.progress = 1
-        focusLabel.text = "FOCUS: ∞"
-        updatePreview()
-    }
-
-    private fun setAutoFocus() {
-        focusSeekBar.progress = 0
-        focusLabel.text = "FOCUS: AUTO"
-        updatePreview()
-    }
-
-    private fun selectIso(value: Int) {
-        val min = isoMin
-        val max = isoMax
-        if (value !in min..max) return
-        selectedIso = value
-        val adapter = isoSpinner.adapter ?: return
-        for (i in 0 until adapter.count) {
-            if (adapter.getItem(i).toString() == "ISO $value") {
-                isoSpinner.setSelection(i)
-                break
-            }
-        }
-    }
-
-    private fun selectShutter(value: Long) {
-        if (value !in exposureMin..exposureMax) return
-        selectedExposureNs = value
-        val adapter = shutterSpinner.adapter ?: return
-        val wanted = formatExposure(value)
-        for (i in 0 until adapter.count) {
-            if (adapter.getItem(i).toString() == wanted) {
-                shutterSpinner.setSelection(i)
-                break
-            }
-        }
+        if (cameraDevice == null || captureSession == null) return
+        startPreview()
     }
 
     private fun capturePhoto() {
-        val camera = cameraDevice ?: return
-        val session = captureSession ?: return
         if (isCapturing) return
 
+        val device = cameraDevice ?: run {
+            toast("Kameran är inte redo.")
+            return
+        }
+
+        val session = captureSession ?: run {
+            toast("Kamerasessionen är inte redo.")
+            return
+        }
+
+        val jpegSurface = jpegReader?.surface ?: run {
+            toast("JPEG-utgång saknas.")
+            return
+        }
+
         isCapturing = true
-        statusLabel.text = "EXPOSING • ${formatExposure(selectedExposureNs)}"
+        captureButton.isEnabled = false
+
+        pendingCaptureResult = null
+        pendingRawImage?.close()
+        pendingRawImage = null
+
+        pendingJpegUri = createMediaStoreUri(
+            displayName = "NightLab_${System.currentTimeMillis()}.jpg",
+            mimeType = "image/jpeg"
+        )
+
+        pendingDngUri =
+            if (rawCheck.isChecked && rawSupported)
+                createMediaStoreUri(
+                    displayName = "NightLab_${System.currentTimeMillis()}.dng",
+                    mimeType = "image/x-adobe-dng"
+                )
+            else null
 
         try {
-            val builder = camera.createCaptureRequest(
-                CameraDevice.TEMPLATE_STILL_CAPTURE
-            )
+            val builder =
+                device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
 
-            builder.addTarget(jpegReader!!.surface)
+            builder.addTarget(jpegSurface)
 
-            if (rawSupported && rawCheckBox.isChecked && rawReader != null) {
-                builder.addTarget(rawReader!!.surface)
+            if (rawCheck.isChecked && rawSupported) {
+                rawReader?.surface?.let { builder.addTarget(it) }
             }
 
-            builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_OFF)
-            builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-            builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, selectedExposureNs)
-            builder.set(CaptureRequest.SENSOR_SENSITIVITY, selectedIso)
-            builder.set(CaptureRequest.JPEG_ORIENTATION, jpegOrientation())
+            builder.set(
+                CaptureRequest.CONTROL_MODE,
+                CameraMetadataCompat.CONTROL_MODE_OFF
+            )
 
-            if (minFocusDistance > 0f && focusSeekBar.progress > 0) {
-                builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+            builder.set(
+                CaptureRequest.CONTROL_AE_MODE,
+                CaptureRequest.CONTROL_AE_MODE_OFF
+            )
+
+            builder.set(
+                CaptureRequest.SENSOR_EXPOSURE_TIME,
+                selectedExposureNs
+            )
+
+            builder.set(
+                CaptureRequest.SENSOR_SENSITIVITY,
+                selectedIso
+            )
+
+            if (minimumFocusDistance > 0f) {
+                builder.set(
+                    CaptureRequest.CONTROL_AF_MODE,
+                    CaptureRequest.CONTROL_AF_MODE_OFF
+                )
                 builder.set(
                     CaptureRequest.LENS_FOCUS_DISTANCE,
-                    minFocusDistance * focusSeekBar.progress / 1000f
+                    focusDistance
                 )
             }
 
-            session.capture(builder.build(), object : CameraCaptureSession.CaptureCallback() {
-        
+            builder.set(
+                CaptureRequest.JPEG_ORIENTATION,
+                getJpegOrientation()
+            )
 
-              override fun onCaptureFailed(
-    session: CameraCaptureSession,
-    request: CaptureRequest,
-    failure: CameraCaptureSession.CaptureFailure
-) {
-    runOnUiThread {
-        statusLabel.text = "CAPTURE FAILED"
-        isCapturing = false
-    }
-}
-            }, cameraHandler)
+            session.capture(
+                builder.build(),
+                object : CameraCaptureSession.CaptureCallback() {
+
+                    override fun onCaptureCompleted(
+                        session: CameraCaptureSession,
+                        request: CaptureRequest,
+                        result: TotalCaptureResult
+                    ) {
+                        pendingCaptureResult = result
+                        savePendingDngIfReady()
+
+                        runOnUiThread {
+                            statusText.text =
+                                "CAPTURED • ISO $selectedIso • ${formatExposure(selectedExposureNs)}"
+                        }
+
+                        finishCaptureSoon()
+                    }
+
+                    override fun onCaptureFailed(
+                        session: CameraCaptureSession,
+                        request: CaptureRequest,
+                        failure: CaptureFailure
+                    ) {
+                        markMediaStoreFailed(pendingJpegUri)
+                        markMediaStoreFailed(pendingDngUri)
+
+                        pendingJpegUri = null
+                        pendingDngUri = null
+                        pendingCaptureResult = null
+
+                        runOnUiThread {
+                            isCapturing = false
+                            captureButton.isEnabled = true
+                            statusText.text = "CAPTURE FAILED"
+                            toast("Fotograferingen misslyckades.")
+                        }
+                    }
+                },
+                cameraHandler
+            )
         } catch (e: Exception) {
+            markMediaStoreFailed(pendingJpegUri)
+            markMediaStoreFailed(pendingDngUri)
+            pendingJpegUri = null
+            pendingDngUri = null
+            pendingCaptureResult = null
             isCapturing = false
-            statusLabel.text = "READY"
-            toast("Fotograferingen misslyckades: ${e.message}")
+            captureButton.isEnabled = true
+            statusText.text = "CAPTURE ERROR"
+            toast("Capture-fel: ${e.message ?: "okänt fel"}")
         }
     }
 
     private fun saveJpeg(image: Image) {
-        val buffer = image.planes[0].buffer
-        val bytes = ByteArray(buffer.remaining())
-        buffer.get(bytes)
-        image.close()
-
-        val values = ContentValues().apply {
-            put(MediaStore.Images.Media.DISPLAY_NAME,
-                "NightLab_${System.currentTimeMillis()}.jpg")
-            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/NightLab")
-                put(MediaStore.Images.Media.IS_PENDING, 1)
-            }
-        }
-
-        val resolver = contentResolver
-        val uri = resolver.insert(
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values
-        ) ?: return
+        val uri = pendingJpegUri ?: return
 
         try {
-            resolver.openOutputStream(uri)?.use { it.write(bytes) }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                values.clear()
-                values.put(MediaStore.Images.Media.IS_PENDING, 0)
-                resolver.update(uri, values, null, null)
+            val buffer = image.planes[0].buffer
+            contentResolver.openOutputStream(uri)?.use { output ->
+                val bytes = ByteArray(buffer.remaining())
+                buffer.get(bytes)
+                output.write(bytes)
             }
-            runOnUiThread { statusLabel.text = "SAVED • JPEG + DNG" }
+
+            finishMediaStoreItem(uri)
+            pendingJpegUri = null
+
+            runOnUiThread {
+                statusText.text =
+                    "SPARAD • Galleri/Pictures/NightLab • JPEG"
+            }
         } catch (e: Exception) {
-            resolver.delete(uri, null, null)
+            markMediaStoreFailed(uri)
+            pendingJpegUri = null
+            runOnUiThread {
+                toast("Kunde inte spara JPEG.")
+            }
         }
     }
 
-    private fun saveDng(image: Image) {
-        val result = lastCaptureResult ?: run {
-            image.close()
-            return
-        }
-        val chars = characteristics ?: run {
-            image.close()
-            return
-        }
-
-        val values = ContentValues().apply {
-            put(MediaStore.Files.FileColumns.DISPLAY_NAME,
-                "NightLab_${System.currentTimeMillis()}.dng")
-            put(MediaStore.Files.FileColumns.MIME_TYPE, "image/x-adobe-dng")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.Files.FileColumns.RELATIVE_PATH, "Pictures/NightLab")
-                put(MediaStore.Files.FileColumns.IS_PENDING, 1)
-            }
-        }
-
-        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        } else {
-            MediaStore.Files.getContentUri("external")
-        }
-
-        val uri: Uri? = contentResolver.insert(collection, values)
-
-        if (uri == null) {
-            image.close()
-            return
-        }
+    private fun savePendingDngIfReady() {
+        val uri = pendingDngUri ?: return
+        val result = pendingCaptureResult ?: return
+        val image = pendingRawImage ?: return
+        val chars = characteristics ?: return
 
         try {
             contentResolver.openOutputStream(uri)?.use { output ->
-                DngCreator(chars, result).use { creator ->
-                    creator.writeImage(output, image)
+                val creator = DngCreator(chars, result)
+                creator.use {
+                    it.writeImage(output, image)
                 }
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                values.clear()
-                values.put(MediaStore.Files.FileColumns.IS_PENDING, 0)
-                contentResolver.update(uri, values, null, null)
+
+            finishMediaStoreItem(uri)
+
+            pendingDngUri = null
+            pendingRawImage?.close()
+            pendingRawImage = null
+
+            runOnUiThread {
+                statusText.text =
+                    "SPARAD • Galleri/Pictures/NightLab • JPEG + DNG"
             }
-        } catch (_: Exception) {
-            contentResolver.delete(uri, null, null)
-        } finally {
-            image.close()
+        } catch (e: Exception) {
+            markMediaStoreFailed(uri)
+            pendingDngUri = null
+            pendingRawImage?.close()
+            pendingRawImage = null
+
+            runOnUiThread {
+                toast("DNG kunde inte sparas: ${e.message ?: "okänt fel"}")
+            }
         }
     }
 
-    private fun jpegOrientation(): Int {
+    private fun finishCaptureSoon() {
+        cameraHandler?.postDelayed({
+            if (rawCheck.isChecked && rawSupported) {
+                if (pendingDngUri != null) {
+                    // Wait briefly for RAW/DNG if the ImageReader is slower.
+                    cameraHandler?.postDelayed({
+                        savePendingDngIfReady()
+                        finishCaptureState()
+                    }, 700)
+                } else {
+                    finishCaptureState()
+                }
+            } else {
+                finishCaptureState()
+            }
+        }, 250)
+    }
+
+    private fun finishCaptureState() {
+        runOnUiThread {
+            isCapturing = false
+            captureButton.isEnabled = true
+        }
+    }
+
+    private fun createMediaStoreUri(
+        displayName: String,
+        mimeType: String
+    ): Uri? {
+        return try {
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
+                put(MediaStore.Images.Media.MIME_TYPE, mimeType)
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(
+                        MediaStore.Images.Media.RELATIVE_PATH,
+                        "Pictures/NightLab"
+                    )
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
+            }
+
+            contentResolver.insert(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                values
+            )
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun finishMediaStoreItem(uri: Uri) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.Images.Media.IS_PENDING, 0)
+            }
+            contentResolver.update(uri, values, null, null)
+        }
+    }
+
+    private fun markMediaStoreFailed(uri: Uri?) {
+        if (uri == null) return
+        try {
+            contentResolver.delete(uri, null, null)
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun getJpegOrientation(): Int {
         val rotation = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             display?.rotation ?: Surface.ROTATION_0
         } else {
@@ -746,46 +1005,119 @@ class MainActivity : ComponentActivity() {
             windowManager.defaultDisplay.rotation
         }
 
-        val degrees = when (rotation) {
-            Surface.ROTATION_0 -> 0
+        val rotationDegrees = when (rotation) {
             Surface.ROTATION_90 -> 90
             Surface.ROTATION_180 -> 180
             Surface.ROTATION_270 -> 270
             else -> 0
         }
 
-        val sensor = characteristics?.get(
-            CameraCharacteristics.SENSOR_ORIENTATION
-        ) ?: 90
+        val sensorOrientation =
+            characteristics?.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
 
-        return (sensor + degrees) % 360
+        val facing =
+            characteristics?.get(CameraCharacteristics.LENS_FACING)
+
+        return if (facing == CameraCharacteristics.LENS_FACING_FRONT) {
+            (sensorOrientation + rotationDegrees) % 360
+        } else {
+            (sensorOrientation - rotationDegrees + 360) % 360
+        }
     }
 
-    private fun formatExposure(ns: Long): String {
-        val seconds = ns / 1_000_000_000.0
-        return when {
-            seconds >= 1.0 -> if (seconds == seconds.toLong().toDouble())
-                "${seconds.toLong()}s"
-            else String.format(Locale.US, "%.1fs", seconds)
-            seconds > 0 -> String.format(Locale.US, "1/%.0fs", 1.0 / seconds)
-            else -> "AUTO"
+    private fun openPicturesFolder() {
+        val intent = android.content.Intent(
+            android.content.Intent.ACTION_VIEW
+        ).apply {
+            type = "image/*"
+            flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+
+        try {
+            startActivity(intent)
+        } catch (_: Exception) {
+            toast("Öppna Galleri och leta efter Pictures/NightLab.")
         }
     }
 
     private fun closeCamera() {
-        try { captureSession?.close() } catch (_: Exception) {}
+        try {
+            captureSession?.stopRepeating()
+        } catch (_: Exception) {
+        }
+
+        try {
+            captureSession?.close()
+        } catch (_: Exception) {
+        }
         captureSession = null
-        try { cameraDevice?.close() } catch (_: Exception) {}
+
+        try {
+            cameraDevice?.close()
+        } catch (_: Exception) {
+        }
         cameraDevice = null
-        try { jpegReader?.close() } catch (_: Exception) {}
+
+        jpegReader?.close()
         jpegReader = null
-        try { rawReader?.close() } catch (_: Exception) {}
+
+        rawReader?.close()
         rawReader = null
+
+        previewReader?.close()
+        previewReader = null
+
+        pendingRawImage?.close()
+        pendingRawImage = null
+
+        cameraOpening = false
+        isCapturing = false
+    }
+
+    private fun formatExposure(ns: Long): String {
+        if (ns >= 1_000_000_000L) {
+            val seconds = ns / 1_000_000_000.0
+            return if (seconds >= 1.0 && seconds % 1.0 == 0.0) {
+                "${seconds.toInt()}s"
+            } else {
+                String.format(Locale.US, "%.1fs", seconds)
+            }
+        }
+
+        val ms = ns / 1_000_000.0
+        return if (ms >= 1.0) {
+            String.format(Locale.US, "%.0fms", ms)
+        } else {
+            String.format(Locale.US, "%.2fms", ms)
+        }
     }
 
     private fun toast(message: String) {
         runOnUiThread {
-            Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+            Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private class SimpleItemSelectedListener(
+        private val action: (Int) -> Unit
+    ) : android.widget.AdapterView.OnItemSelectedListener {
+
+        override fun onItemSelected(
+            parent: android.widget.AdapterView<*>?,
+            view: View?,
+            position: Int,
+            id: Long
+        ) {
+            action(position)
+        }
+
+        override fun onNothingSelected(
+            parent: android.widget.AdapterView<*>?
+        ) = Unit
+    }
+
+    private object CameraMetadataCompat {
+        const val CONTROL_MODE_AUTO = 1
+        const val CONTROL_MODE_OFF = 0
     }
 }
