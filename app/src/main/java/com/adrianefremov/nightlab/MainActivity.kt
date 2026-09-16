@@ -1,5 +1,5 @@
 package com.adrianefremov.nightlab
-
+import android.hardware.camera2.CaptureFailure
 import android.Manifest
 import android.content.ContentValues
 import android.content.Context
@@ -55,7 +55,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var rawCheckBox: CheckBox
     private lateinit var infoLabel: TextView
     private lateinit var statusLabel: TextView
-
+    val shutterArea = FrameLayout(this)
     private lateinit var cameraManager: CameraManager
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
